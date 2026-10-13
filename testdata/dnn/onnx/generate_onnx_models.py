@@ -3660,6 +3660,7 @@ generate_batchnorm_conv_fold("batchnorm_conv_dense", 8, 16, 10, 3, 1)
 generate_batchnorm_conv_fold("batchnorm_conv_depthwise", 8, 8, 10, 3, 8)
 generate_batchnorm_conv_fold("batchnorm_conv_grouped", 16, 16, 10, 3, 4)
 generate_batchnorm_conv_fold("batchnorm_conv_1x1_mlas", 256, 256, 16, 1, 1)
+generate_batchnorm_conv_fold("batchnorm_conv_small_cin", 3, 16, 10, 3, 1)  # plain-input conv path
 
 # ConvTranspose + Add models for the TransformLayout+Add fusion and the
 # deconvolution spatial-chunking path.
@@ -3724,3 +3725,89 @@ def generate_deconv_transform_add():
     export(deconv_add, (x, residual), ["input", "residual"], "deconv_transform_add_broadcast")
 
 generate_deconv_transform_add()
+
+# Models for test_fast_paths.cpp. Weights come from formula_weights(),
+# so the C++ test rebuilds them and computes the expected output itself.
+def generate_fast_path_models():
+    import onnxruntime as ort
+
+    # Multiples of 1/256 in [-30/256, 30/256], exact in float32; same as formulaWeights() in the test.
+    def formula_weights(shape, salt=1):
+        i = np.arange(int(np.prod(shape)), dtype=np.int64)
+        return ((((i * 37 + salt) % 61) - 30) / 256.0).astype(np.float32).reshape(shape)
+
+    def save(name, nodes, inputs, outputs, inits):
+        graph = helper.make_graph(nodes, name,
+            [helper.make_tensor_value_info(n, TensorProto.FLOAT, s) for n, s in inputs],
+            [helper.make_tensor_value_info(n, TensorProto.FLOAT, s) for n, s in outputs],
+            initializer=[numpy_helper.from_array(v, k) for k, v in inits.items()])
+        model = helper.make_model(graph, producer_name="opencv_dnn_fast_paths",
+                                  opset_imports=[helper.make_opsetid("", 17)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = os.path.join("models", name + ".onnx")
+        onnx.save(model, path)
+        # Only check that the model runs with the declared output shapes.
+        feeds = {n: np.random.uniform(-1, 1, s).astype(np.float32) for n, s in inputs}
+        results = ort.InferenceSession(path, providers=["CPUExecutionProvider"]).run(None, feeds)
+        for (n, s), y in zip(outputs, results):
+            assert list(y.shape) == s, "{}: output {} has shape {}".format(name, n, y.shape)
+
+    W = formula_weights
+    node = helper.make_node
+    silu = lambda x, y: [node("Sigmoid", [x], [x + "_sig"]), node("Mul", [x, x + "_sig"], [y])]
+    sizes = lambda *s: np.array(s, np.int64)
+
+    # LayerScale: (X*W + b) * gamma + beta folds into the Gemm. The same chain on S also
+    # outputs the MatMul result, so there the Mul must stay.
+    save("matmul_channel_affine", [
+        node("MatMul", ["X", "W"], ["mm"]),
+        node("Add", ["b", "mm"], ["proj_x"]),
+        node("Mul", ["proj_x", "gamma"], ["scaled"]),
+        node("Add", ["scaled", "beta"], ["Y"]),
+        node("MatMul", ["S", "W"], ["mm_s"]),
+        node("Add", ["b", "mm_s"], ["proj"]),
+        node("Mul", ["proj", "gamma"], ["Y_shared"]),
+    ], [("X", [2, 5, 16]), ("S", [2, 5, 16])],
+       [("Y", [2, 5, 24]), ("proj", [2, 5, 24]), ("Y_shared", [2, 5, 24])],
+       dict(W=W((16, 24)), b=W((24,), 2), gamma=1 + W((24,), 3), beta=W((24,), 4)))
+
+    # A 1x9 kernel (not 3x3), and a 3x3 conv with stride (2, 1) + SiLU and with stride (2, 2).
+    # 24 wide, so the stride-2 conv also runs the kernel's 6-pixel inner block.
+    save("conv_9tap_and_strided", [
+        node("Conv", ["X", "W1"], ["Y_1x9"], kernel_shape=[1, 9], pads=[0, 4, 0, 4]),
+        node("Conv", ["X", "W2", "B2"], ["c"], kernel_shape=[3, 3], strides=[2, 1], pads=[0, 1, 1, 2]),
+        node("Conv", ["X", "W2", "B2"], ["Y_3x3_s2"], kernel_shape=[3, 3], strides=[2, 2], pads=[0, 1, 1, 2]),
+    ] + silu("c", "Y_3x3"), [("X", [1, 16, 12, 24])],
+       [("Y_1x9", [1, 16, 12, 24]), ("Y_3x3", [1, 32, 6, 25]), ("Y_3x3_s2", [1, 32, 6, 13])],
+       dict(W1=W((16, 16, 1, 9)), W2=W((32, 16, 3, 3), 5), B2=W((32,), 6)))
+
+    # Convs with 3 input channels (plain-input path): stride 2 + ReLU, and dilation 2 without bias.
+    save("conv_small_cin", [
+        node("Conv", ["X", "W1", "B1"], ["c"], kernel_shape=[3, 3], strides=[2, 2], pads=[1, 1, 1, 1]),
+        node("Relu", ["c"], ["Y_s2"]),
+        node("Conv", ["X", "W2"], ["Y_d2"], kernel_shape=[3, 3], dilations=[2, 2], pads=[2, 2, 2, 2]),
+    ], [("X", [2, 3, 17, 15])],
+       [("Y_s2", [2, 16, 9, 8]), ("Y_d2", [2, 8, 17, 15])],
+       dict(W1=W((16, 3, 3, 3), 7), B1=W((16,), 8), W2=W((8, 3, 3, 3), 9)))
+
+    # Split of a conv output: aligned (the YOLO C3k2 chain), unaligned, along H, and with no sizes input.
+    save("split_block_layout", [
+        node("Conv", ["X", "W1", "B1"], ["c1"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]),
+        node("Split", ["c1", "s_aligned"], ["a", "b"], axis=1),
+        node("Conv", ["b", "W2", "B2"], ["c2"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]),
+        node("Add", ["b", "c2"], ["r"]),
+        node("Concat", ["a", "b", "r"], ["Y_aligned"], axis=1),
+        node("Split", ["c1", "s_unaligned"], ["u0", "u1"], axis=1),
+        node("Concat", ["u1", "u0"], ["Y_unaligned"], axis=1),
+        node("Split", ["c1", "s_height"], ["h0", "h1"], axis=2),
+        node("Concat", ["h0", "h1"], ["Y_height"], axis=3),
+        node("Split", ["c1"], ["d0", "d1"], axis=1),
+        node("Concat", ["d1", "d0"], ["Y_default"], axis=1),
+    ], [("X", [1, 8, 10, 12])],
+       [("Y_aligned", [1, 48, 10, 12]), ("Y_unaligned", [1, 32, 10, 12]), ("Y_height", [1, 32, 5, 24]),
+        ("Y_default", [1, 32, 10, 12])],
+       dict(W1=W((32, 8, 3, 3)), B1=W((32,), 2), W2=W((16, 16, 3, 3), 5), B2=W((16,), 6),
+            s_aligned=sizes(16, 16), s_unaligned=sizes(12, 20), s_height=sizes(5, 5)))
+
+generate_fast_path_models()

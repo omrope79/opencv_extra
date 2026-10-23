@@ -3309,6 +3309,46 @@ def generate_resize_no_scales(name="resize_no_scales"):
 
 generate_resize_no_scales()
 
+def generate_qconv_bias_case(name, x_scale, w_scale, w_zp, num_out, bias):
+    # QLinearConv with constant x_scale, w_scale and int32 bias. The importer
+    # folds the bias to float using x_scale[0] and the per-channel w_scale, so
+    # these inputs must agree with each other. Load-only model, no reference data.
+    X = onnx.helper.make_tensor_value_info("x", TensorProto.UINT8, [1, 1, 2, 2])
+    Y = onnx.helper.make_tensor_value_info("y", TensorProto.UINT8, [1, num_out, 2, 2])
+    inits = [
+        onnx.numpy_helper.from_array(x_scale, "x_scale"),
+        onnx.numpy_helper.from_array(np.array(0, dtype=np.uint8), "x_zp"),
+        onnx.numpy_helper.from_array(np.ones((num_out, 1, 1, 1), dtype=np.int8), "w"),
+        onnx.numpy_helper.from_array(w_scale, "w_scale"),
+        onnx.numpy_helper.from_array(w_zp, "w_zp"),
+        onnx.numpy_helper.from_array(np.array(0.25, dtype=np.float32), "y_scale"),
+        onnx.numpy_helper.from_array(np.array(0, dtype=np.uint8), "y_zp"),
+        onnx.numpy_helper.from_array(bias, "B"),
+    ]
+    node = onnx.helper.make_node("QLinearConv",
+                                 ["x", "x_scale", "x_zp", "w", "w_scale", "w_zp", "y_scale", "y_zp", "B"],
+                                 ["y"])
+    graph = onnx.helper.make_graph([node], name, [X], [Y], initializer=inits)
+    model = onnx.helper.make_model(graph, producer_name=name,
+                                   opset_imports=[onnx.helper.make_opsetid("", 10)])
+    model.ir_version = 7
+    onnx.checker.check_model(model)
+    onnx.save(model, "models/{}.onnx".format(name))
+
+# Per-channel w_scale with 64 entries but a 1-element bias: the fold loop ran
+# over w_scale and wrote past the bias buffer.
+generate_qconv_bias_case("qconv_bias_scale_mismatch",
+                         x_scale=np.array(0.5, dtype=np.float32),
+                         w_scale=np.full(64, 0.1, dtype=np.float32),
+                         w_zp=np.zeros(64, dtype=np.int8),
+                         num_out=64, bias=np.array([7], dtype=np.int32))
+# Empty x_scale: the fold read x_scale[0] unconditionally.
+generate_qconv_bias_case("qconv_empty_x_scale",
+                         x_scale=np.zeros(0, dtype=np.float32),
+                         w_scale=np.array(0.1, dtype=np.float32),
+                         w_zp=np.array(0, dtype=np.int8),
+                         num_out=1, bias=np.array([7], dtype=np.int32))
+
 ################# GELU #################
 
 x = torch.randn(1, 5, 20)
@@ -3618,7 +3658,7 @@ def generate_attention_shared_shape_reshape(name="attention_shared_shape_reshape
 
 generate_attention_shared_shape_reshape()
 
-def generate_batchnorm_conv_fold(name, C_in, C_out, spatial, ksize, group):
+def generate_batchnorm_conv_fold(name, C_in, C_out, spatial, ksize, group, stride=1):
     # BatchNorm feeding a conv: fuseBN() folds the scale and shift into the conv weights,
     # which are packed by then, so each weight layout the conv keeps has to be reached.
     np.random.seed(0x12345)
@@ -3637,9 +3677,9 @@ def generate_batchnorm_conv_fold(name, C_in, C_out, spatial, ksize, group):
         # The fold refuses a padded conv, and arms the MLAS 1x1 pre-pack only when every
         # stride is stated, so both are explicit here.
         helper.make_node("Conv", ["N", "W"], ["Y"], kernel_shape=[ksize, ksize],
-                         strides=[1, 1], dilations=[1, 1], pads=[0, 0, 0, 0], group=group),
+                         strides=[stride, stride], dilations=[1, 1], pads=[0, 0, 0, 0], group=group),
     ]
-    out_s = S - ksize + 1
+    out_s = (S - ksize) // stride + 1
     X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, C_in, S, S])
     Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, C_out, out_s, out_s])
     graph = helper.make_graph(nodes, name, [X], [Y], initializers)
@@ -3660,6 +3700,7 @@ generate_batchnorm_conv_fold("batchnorm_conv_dense", 8, 16, 10, 3, 1)
 generate_batchnorm_conv_fold("batchnorm_conv_depthwise", 8, 8, 10, 3, 8)
 generate_batchnorm_conv_fold("batchnorm_conv_grouped", 16, 16, 10, 3, 4)
 generate_batchnorm_conv_fold("batchnorm_conv_1x1_mlas", 256, 256, 16, 1, 1)
+generate_batchnorm_conv_fold("batchnorm_conv_small_cin", 3, 16, 12, 4, 1, stride=4)  # plain-input patch embedding
 
 # ConvTranspose + Add models for the TransformLayout+Add fusion and the
 # deconvolution spatial-chunking path.
@@ -3724,3 +3765,705 @@ def generate_deconv_transform_add():
     export(deconv_add, (x, residual), ["input", "residual"], "deconv_transform_add_broadcast")
 
 generate_deconv_transform_add()
+
+# Attention blocks where a Q/K/V projection has no bias. The fused Attention layer still needs the
+# full QKV bias, so the missing part becomes zeros.
+def generate_attention_missing_bias():
+    import onnxruntime as ort
+
+    S, C, H = 6, 16, 2
+    D = C // H
+
+    # ViT-style: scores divided by sqrt(D) after Q*K^T (trOCR encoder, BEiT)
+    class VitAttention(nn.Module):
+        def __init__(self, q_bias, k_bias, v_bias):
+            super(VitAttention, self).__init__()
+            self.q = nn.Linear(C, C, bias=q_bias)
+            self.k = nn.Linear(C, C, bias=k_bias)
+            self.v = nn.Linear(C, C, bias=v_bias)
+
+        def heads(self, t):
+            return t.reshape(t.shape[0], t.shape[1], H, D).permute(0, 2, 1, 3)
+
+        def forward(self, x):
+            q, k, v = self.heads(self.q(x)), self.heads(self.k(x)), self.heads(self.v(x))
+            a = torch.softmax(torch.matmul(q, k.transpose(-1, -2)) / (D ** 0.5), dim=-1)
+            o = torch.matmul(a, v).permute(0, 2, 1, 3)
+            return o.reshape(o.shape[0], o.shape[1], C)
+
+    # CLIP-style: Q scaled before Q*K^T, batched matmuls on (B*H, S, D)
+    class ClipAttention(nn.Module):
+        def __init__(self):
+            super(ClipAttention, self).__init__()
+            self.q = nn.Linear(C, C)
+            self.k = nn.Linear(C, C, bias=False)
+            self.v = nn.Linear(C, C)
+
+        def heads(self, t, b, s):
+            return t.reshape(b, s, H, D).transpose(1, 2).reshape(b * H, s, D)
+
+        def forward(self, x):
+            b, s, _ = x.shape
+            q = self.heads(self.q(x) * (D ** -0.5), b, s)
+            k = self.heads(self.k(x), b, s)
+            v = self.heads(self.v(x), b, s)
+            a = torch.softmax(torch.bmm(q, k.transpose(1, 2)), dim=-1)
+            o = torch.bmm(a, v).reshape(b, H, s, D).transpose(1, 2)
+            return o.reshape(b, s, C)
+
+    # timm-style: one qkv projection, split by Reshape + Transpose + Gather
+    class CombinedQKVAttention(nn.Module):
+        def __init__(self):
+            super(CombinedQKVAttention, self).__init__()
+            self.qkv = nn.Linear(C, 3 * C, bias=False)
+
+        def forward(self, x):
+            b, s, _ = x.shape
+            qkv = self.qkv(x).reshape(b, s, 3, H, D).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv[0], qkv[1], qkv[2]
+            a = torch.softmax(torch.matmul(q * (D ** -0.5), k.transpose(-2, -1)), dim=-1)
+            o = torch.matmul(a, v).transpose(1, 2)
+            return o.reshape(b, s, C)
+
+    def export(model, name):
+        for p in model.parameters():
+            nn.init.uniform_(p, -0.5, 0.5)
+        model.eval()
+        x = torch.empty(1, S, C).uniform_(-1, 1)
+        path = os.path.join("models", name + ".onnx")
+        with torch.no_grad():
+            expected = model(x)
+            torch.onnx.export(model, x, path, input_names=["input"], output_names=["output"],
+                              opset_version=13, dynamo=False)
+        actual = ort.InferenceSession(path).run(None, {"input": x.numpy()})[0]
+        max_diff = np.abs(actual - expected.numpy()).max()
+        assert max_diff < 1e-5, "PyTorch/onnxruntime mismatch for {}: {}".format(name, max_diff)
+        np.save(os.path.join("data", "input_" + name + ".npy"), x.numpy())
+        np.save(os.path.join("data", "output_" + name + ".npy"), np.ascontiguousarray(expected.numpy()))
+
+    torch.manual_seed(11)
+    export(VitAttention(False, False, False), "attention_no_qkv_bias")
+    export(VitAttention(True, False, True), "attention_no_k_bias")
+    export(ClipAttention(), "clip_attention_no_k_bias")
+    export(CombinedQKVAttention(), "attention_combined_qkv_no_bias")
+
+    # K bias is one scalar instead of one value per channel, so it cannot fill the K part of the QKV bias
+    class ScalarBiasLinear(nn.Linear):
+        def forward(self, x):
+            return super(ScalarBiasLinear, self).forward(x) + 0.5
+
+    scalar_k_bias = VitAttention(True, False, True)
+    scalar_k_bias.k = ScalarBiasLinear(C, C, bias=False)
+    export(scalar_k_bias, "attention_scalar_k_bias")
+
+generate_attention_missing_bias()
+
+# Built with onnx.helper, not a traced PyTorch export, so the QKV reshape target stays a real
+# Shape/Gather/Mul/Concat chain instead of being constant-folded by the tracer.
+def generate_attention_qkv_grouping():
+    import onnxruntime as ort
+
+    def i64(name, arr):
+        return numpy_helper.from_array(np.array(arr, dtype=np.int64), name)
+
+    def build(name, merge_seq):
+        # merge_seq: reshape to [B, T*S, H, D] if True, else [B*T, S, H, D].
+        np.random.seed(0x2026)
+        B, T, S, C, H = 2, 3, 5, 8, 2
+        D = C // H
+
+        def w(nm):
+            return numpy_helper.from_array((np.random.randn(C, C) / np.sqrt(C)).astype(np.float32), nm)
+
+        initializers = [
+            w("Wq"), w("Wk"), w("Wv"),
+            numpy_helper.from_array(np.float32(np.sqrt(D)), "div_scalar"),
+            i64("idx0", 0), i64("idx1", 1), i64("idx2", 2),
+            i64("ax0", [0]),
+            i64("H_const", [H]), i64("D_const", [D]),
+            i64("out_shape", [B, T, S, C]),
+        ]
+
+        nodes = [
+            helper.make_node("MatMul", ["X", "Wq"], ["Q"]),
+            helper.make_node("MatMul", ["X", "Wk"], ["K"]),
+            helper.make_node("MatMul", ["X", "Wv"], ["V"]),
+            helper.make_node("Shape", ["X"], ["shpX"]),
+            helper.make_node("Gather", ["shpX", "idx0"], ["gB"], axis=0),
+            helper.make_node("Gather", ["shpX", "idx1"], ["gT"], axis=0),
+            helper.make_node("Gather", ["shpX", "idx2"], ["gS"], axis=0),
+        ]
+        if merge_seq:
+            # batch = gB alone; seq = gT * gS (evalDims recurses through the Mul)
+            nodes += [
+                helper.make_node("Mul", ["gT", "gS"], ["gMerged"]),
+                helper.make_node("Unsqueeze", ["gB", "ax0"], ["dim0"]),
+                helper.make_node("Unsqueeze", ["gMerged", "ax0"], ["dim1"]),
+            ]
+        else:
+            # batch = gB * gT; seq = gS alone
+            nodes += [
+                helper.make_node("Mul", ["gB", "gT"], ["gMerged"]),
+                helper.make_node("Unsqueeze", ["gMerged", "ax0"], ["dim0"]),
+                helper.make_node("Unsqueeze", ["gS", "ax0"], ["dim1"]),
+            ]
+        nodes += [
+            helper.make_node("Concat", ["dim0", "dim1", "H_const", "D_const"], ["qkv_shape"], axis=0),
+            helper.make_node("Reshape", ["Q", "qkv_shape"], ["Qr"]),
+            helper.make_node("Reshape", ["K", "qkv_shape"], ["Kr"]),
+            helper.make_node("Reshape", ["V", "qkv_shape"], ["Vr"]),
+            helper.make_node("Transpose", ["Qr"], ["Qt"], perm=[0, 2, 1, 3]),
+            helper.make_node("Transpose", ["Kr"], ["Kt"], perm=[0, 2, 3, 1]),
+            helper.make_node("Transpose", ["Vr"], ["Vt"], perm=[0, 2, 1, 3]),
+            helper.make_node("MatMul", ["Qt", "Kt"], ["QK"]),
+            helper.make_node("Div", ["QK", "div_scalar"], ["QKs"]),
+            helper.make_node("Softmax", ["QKs"], ["A"], axis=-1),
+            helper.make_node("MatMul", ["A", "Vt"], ["AV"]),
+            helper.make_node("Transpose", ["AV"], ["AVt"], perm=[0, 2, 1, 3]),
+            helper.make_node("Reshape", ["AVt", "out_shape"], ["Y"]),
+        ]
+
+        X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [B, T, S, C])
+        Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [B, T, S, C])
+        graph = helper.make_graph(nodes, name, [X], [Y], initializers)
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        model = onnx.shape_inference.infer_shapes(model)
+        path = os.path.join("models", name + ".onnx")
+        onnx.save(model, path)
+
+        x = (np.random.randn(B, T, S, C) * 0.5).astype(np.float32)
+        out = ort.InferenceSession(path).run(["Y"], {"X": x})[0]
+        np.save(os.path.join("data", "input_" + name + ".npy"), x)
+        np.save(os.path.join("data", "output_" + name + ".npy"), out)
+
+    build("attention_qkv_grouping_seq_merge", merge_seq=True)
+    build("attention_qkv_grouping_batch_merge", merge_seq=False)
+
+generate_attention_qkv_grouping()
+
+# com.microsoft MultiHeadAttention bias/key_padding_mask support: bias as a packed
+# Q/K/V projection bias (dynamic Shape/Slice2 split when hidden size/bias aren't
+# statically known, a constant-folded split otherwise) and key_padding_mask lowered
+# to an additive attn_mask.
+def generate_multi_head_attention_models():
+    batch, seq_q, seq_kv, num_heads, head_size = 2, 3, 5, 2, 4
+    hidden = num_heads * head_size
+    v_hidden = hidden
+
+
+    def softmax(x, axis=-1):
+        x = x - np.max(x, axis=axis, keepdims=True)
+        e = np.exp(x)
+        return e / np.sum(e, axis=axis, keepdims=True)
+
+
+    def ref_mha(q, k, v, q_bias, k_bias, v_bias, mask, num_heads, mask_filter_value=-10000.0,
+                attention_bias=None):
+        b, sq, h = q.shape
+        _, skv, _ = k.shape
+        hd = h // num_heads
+        qq = (q + q_bias).reshape(b, sq, num_heads, hd).transpose(0, 2, 1, 3)
+        kk = (k + k_bias).reshape(b, skv, num_heads, hd).transpose(0, 2, 1, 3)
+        vv = (v + v_bias).reshape(b, skv, num_heads, hd).transpose(0, 2, 1, 3)
+        scale = 1.0 / np.sqrt(hd)
+        scores = np.einsum('bhqd,bhkd->bhqk', qq, kk) * scale
+        if mask is not None:
+            # matches the importer: mask*(-mfv) + mfv -> 1 maps to 0, 0 maps to mfv
+            bias_add = mask.astype(np.float32) * (-mask_filter_value) + mask_filter_value
+            scores = scores + bias_add[:, None, None, :]
+        if attention_bias is not None:
+            # already additive, summed with the key_padding_mask bias rather than replacing it
+            scores = scores + attention_bias
+        probs = softmax(scores, axis=-1)
+        out = np.einsum('bhqk,bhkd->bhqd', probs, vv)
+        out = out.transpose(0, 2, 1, 3).reshape(b, sq, h)
+        return out
+
+
+    def save_npy(basename, idx, arr, is_input=True):
+        if is_input:
+            path = f"data/input_{basename}_{idx}.npy"
+        else:
+            path = f"data/output_{basename}.npy"
+        np.save(path, arr)
+        print("wrote", path, arr.shape, arr.dtype)
+
+
+    def build_model(basename, use_bias, use_mask, seed, mask_filter_value=None):
+        rng = np.random.RandomState(seed)
+        q = rng.randn(batch, seq_q, hidden).astype(np.float32)
+        k = rng.randn(batch, seq_kv, hidden).astype(np.float32)
+        v = rng.randn(batch, seq_kv, v_hidden).astype(np.float32)
+
+        inputs_vi = [
+            helper.make_tensor_value_info('query', TensorProto.FLOAT, [batch, seq_q, hidden]),
+            helper.make_tensor_value_info('key', TensorProto.FLOAT, [batch, seq_kv, hidden]),
+            helper.make_tensor_value_info('value', TensorProto.FLOAT, [batch, seq_kv, v_hidden]),
+        ]
+        node_inputs = ['query', 'key', 'value']
+        npy_inputs = [q, k, v]
+
+        q_bias = k_bias = v_bias = np.zeros(hidden, dtype=np.float32)
+        if use_bias:
+            bias = rng.randn(hidden + hidden + v_hidden).astype(np.float32)
+            q_bias, k_bias, v_bias = np.split(bias, [hidden, 2 * hidden])
+            inputs_vi.append(helper.make_tensor_value_info(
+                'bias', TensorProto.FLOAT, [hidden + hidden + v_hidden]))
+            node_inputs.append('bias')
+            npy_inputs.append(bias)
+        else:
+            node_inputs.append('')  # omitted optional
+
+        mask = None
+        if use_mask:
+            mask = np.ones((batch, seq_kv), dtype=np.int32)
+            mask[0, -2:] = 0
+            mask[1, -1:] = 0
+            inputs_vi.append(helper.make_tensor_value_info(
+                'key_padding_mask', TensorProto.INT32, [batch, seq_kv]))
+            node_inputs.append('key_padding_mask')
+            npy_inputs.append(mask)
+        else:
+            node_inputs.append('')
+
+        mfv = -10000.0 if mask_filter_value is None else mask_filter_value
+        ref = ref_mha(q, k, v, q_bias, k_bias, v_bias, mask, num_heads, mfv)
+
+        for i, arr in enumerate(npy_inputs):
+            save_npy(basename, i, arr, is_input=True)
+        save_npy(basename, 0, ref, is_input=False)
+
+        out_vi = helper.make_tensor_value_info('output', TensorProto.FLOAT, [batch, seq_q, hidden])
+        node_kwargs = dict(domain='com.microsoft', num_heads=num_heads)
+        if mask_filter_value is not None:
+            node_kwargs['mask_filter_value'] = mask_filter_value
+        node = helper.make_node('MultiHeadAttention', node_inputs, ['output'], **node_kwargs)
+        graph = helper.make_graph([node], basename, inputs_vi, [out_vi])
+        model = helper.make_model(graph, opset_imports=[
+            helper.make_opsetid('', 18), helper.make_opsetid('com.microsoft', 1)])
+        model.ir_version = 9
+        onnx.checker.check_model(model)
+        path = f"models/{basename}.onnx"
+        onnx.save(model, path)
+        print("wrote", path)
+        return len(npy_inputs)
+
+
+    def build_projected_model(basename, seed):
+        """Q/K/V come from in-graph MatMul projections (real HF-export layout), not graph
+        inputs - the case the static import-time shape read used to reject."""
+        rng = np.random.RandomState(seed)
+        hs = rng.randn(batch, seq_kv, hidden).astype(np.float32)
+        Wq = (rng.randn(hidden, hidden) / np.sqrt(hidden)).astype(np.float32)
+        Wk = (rng.randn(hidden, hidden) / np.sqrt(hidden)).astype(np.float32)
+        Wv = (rng.randn(hidden, v_hidden) / np.sqrt(hidden)).astype(np.float32)
+        bias = rng.randn(hidden + hidden + v_hidden).astype(np.float32)
+        q_bias, k_bias, v_bias = np.split(bias, [hidden, 2 * hidden])
+        mask = np.ones((batch, seq_kv), dtype=np.int32)
+        mask[0, -2:] = 0
+        mask[1, -1:] = 0
+
+        q = hs @ Wq
+        k = hs @ Wk
+        v = hs @ Wv
+        ref = ref_mha(q, k, v, q_bias, k_bias, v_bias, mask, num_heads)
+
+        save_npy(basename, 0, hs, is_input=True)
+        save_npy(basename, 1, bias, is_input=True)
+        save_npy(basename, 2, mask, is_input=True)
+        save_npy(basename, 0, ref, is_input=False)
+
+        initializers = [
+            numpy_helper.from_array(Wq, 'Wq'),
+            numpy_helper.from_array(Wk, 'Wk'),
+            numpy_helper.from_array(Wv, 'Wv'),
+        ]
+        nodes = [
+            helper.make_node('MatMul', ['hidden_states', 'Wq'], ['q']),
+            helper.make_node('MatMul', ['hidden_states', 'Wk'], ['k']),
+            helper.make_node('MatMul', ['hidden_states', 'Wv'], ['v']),
+            helper.make_node('MultiHeadAttention', ['q', 'k', 'v', 'bias', 'key_padding_mask'],
+                             ['output'], domain='com.microsoft', num_heads=num_heads),
+        ]
+        inputs_vi = [
+            helper.make_tensor_value_info('hidden_states', TensorProto.FLOAT, [batch, seq_kv, hidden]),
+            helper.make_tensor_value_info('bias', TensorProto.FLOAT, [hidden + hidden + v_hidden]),
+            helper.make_tensor_value_info('key_padding_mask', TensorProto.INT32, [batch, seq_kv]),
+        ]
+        out_vi = helper.make_tensor_value_info('output', TensorProto.FLOAT, [batch, seq_kv, hidden])
+        graph = helper.make_graph(nodes, basename, inputs_vi, [out_vi], initializers)
+        model = helper.make_model(graph, opset_imports=[
+            helper.make_opsetid('', 18), helper.make_opsetid('com.microsoft', 1)])
+        model.ir_version = 9
+        onnx.checker.check_model(model)
+        path = f"models/{basename}.onnx"
+        onnx.save(model, path)
+        print("wrote", path)
+
+
+    def build_fp16_mask_model(basename, seed):
+        """Q/K/V cast to float16 in-graph; mask's cast must follow, not stay float32.
+        Inputs/output stay float32 on disk - blobFromNPY cannot load <f2."""
+        rng = np.random.RandomState(seed)
+        # pre-rounded to fp16 precision so the float32 file matches what the cast will produce
+        q = rng.randn(batch, seq_q, hidden).astype(np.float16).astype(np.float32)
+        k = rng.randn(batch, seq_kv, hidden).astype(np.float16).astype(np.float32)
+        v = rng.randn(batch, seq_kv, v_hidden).astype(np.float16).astype(np.float32)
+        mask = np.ones((batch, seq_kv), dtype=np.int32)
+        mask[0, -2:] = 0
+        mask[1, -1:] = 0
+        zero_bias = np.zeros(hidden, dtype=np.float32)
+
+        ref = ref_mha(q, k, v, zero_bias, zero_bias, zero_bias, mask, num_heads)
+
+        save_npy(basename, 0, q, is_input=True)
+        save_npy(basename, 1, k, is_input=True)
+        save_npy(basename, 2, v, is_input=True)
+        save_npy(basename, 3, mask, is_input=True)
+        save_npy(basename, 0, ref, is_input=False)
+
+        inputs_vi = [
+            helper.make_tensor_value_info('query', TensorProto.FLOAT, [batch, seq_q, hidden]),
+            helper.make_tensor_value_info('key', TensorProto.FLOAT, [batch, seq_kv, hidden]),
+            helper.make_tensor_value_info('value', TensorProto.FLOAT, [batch, seq_kv, v_hidden]),
+            helper.make_tensor_value_info('key_padding_mask', TensorProto.INT32, [batch, seq_kv]),
+        ]
+        out_vi = helper.make_tensor_value_info('output', TensorProto.FLOAT16, [batch, seq_q, hidden])
+        nodes = [
+            helper.make_node('Cast', ['query'], ['query_f16'], to=TensorProto.FLOAT16),
+            helper.make_node('Cast', ['key'], ['key_f16'], to=TensorProto.FLOAT16),
+            helper.make_node('Cast', ['value'], ['value_f16'], to=TensorProto.FLOAT16),
+            helper.make_node(
+                'MultiHeadAttention', ['query_f16', 'key_f16', 'value_f16', '', 'key_padding_mask'],
+                ['output'], domain='com.microsoft', num_heads=num_heads),
+        ]
+        graph = helper.make_graph(nodes, basename, inputs_vi, [out_vi])
+        model = helper.make_model(graph, opset_imports=[
+            helper.make_opsetid('', 18), helper.make_opsetid('com.microsoft', 1)])
+        model.ir_version = 9
+        onnx.checker.check_model(model)
+        path = f"models/{basename}.onnx"
+        onnx.save(model, path)
+        print("wrote", path)
+
+
+    def build_const_bias_model(basename, seed):
+        """Q/K/V are plain graph inputs (known hidden size) and bias is a true ONNX initializer
+        (constant), so the importer's static bias-split path should fire - no runtime Shape/Slice2,
+        net stays shape-inferable past this node."""
+        rng = np.random.RandomState(seed)
+        q = rng.randn(batch, seq_q, hidden).astype(np.float32)
+        k = rng.randn(batch, seq_kv, hidden).astype(np.float32)
+        v = rng.randn(batch, seq_kv, v_hidden).astype(np.float32)
+        bias = rng.randn(hidden + hidden + v_hidden).astype(np.float32)
+        q_bias, k_bias, v_bias = np.split(bias, [hidden, 2 * hidden])
+        ref = ref_mha(q, k, v, q_bias, k_bias, v_bias, None, num_heads)
+
+        save_npy(basename, 0, q, is_input=True)
+        save_npy(basename, 1, k, is_input=True)
+        save_npy(basename, 2, v, is_input=True)
+        save_npy(basename, 0, ref, is_input=False)
+
+        initializers = [numpy_helper.from_array(bias, 'bias')]
+        inputs_vi = [
+            helper.make_tensor_value_info('query', TensorProto.FLOAT, [batch, seq_q, hidden]),
+            helper.make_tensor_value_info('key', TensorProto.FLOAT, [batch, seq_kv, hidden]),
+            helper.make_tensor_value_info('value', TensorProto.FLOAT, [batch, seq_kv, v_hidden]),
+        ]
+        out_vi = helper.make_tensor_value_info('output', TensorProto.FLOAT, [batch, seq_q, hidden])
+        node = helper.make_node('MultiHeadAttention', ['query', 'key', 'value', 'bias'], ['output'],
+                                domain='com.microsoft', num_heads=num_heads)
+        graph = helper.make_graph([node], basename, inputs_vi, [out_vi], initializers)
+        model = helper.make_model(graph, opset_imports=[
+            helper.make_opsetid('', 18), helper.make_opsetid('com.microsoft', 1)])
+        model.ir_version = 9
+        onnx.checker.check_model(model)
+        path = f"models/{basename}.onnx"
+        onnx.save(model, path)
+        print("wrote", path)
+
+
+    def build_in_graph_mask_model(basename, seed):
+        """key_padding_mask arrives as int64 and is Cast to int32 before MultiHeadAttention, so
+        its Arg is a node output (unknown rank at import), not a shaped graph input - the one
+        case the importer's rank check used to reject outright."""
+        rng = np.random.RandomState(seed)
+        q = rng.randn(batch, seq_q, hidden).astype(np.float32)
+        k = rng.randn(batch, seq_kv, hidden).astype(np.float32)
+        v = rng.randn(batch, seq_kv, v_hidden).astype(np.float32)
+        mask64 = np.ones((batch, seq_kv), dtype=np.int64)
+        mask64[0, -2:] = 0
+        mask64[1, -1:] = 0
+        zero_bias = np.zeros(hidden, dtype=np.float32)
+        ref = ref_mha(q, k, v, zero_bias, zero_bias, zero_bias, mask64, num_heads)
+
+        save_npy(basename, 0, q, is_input=True)
+        save_npy(basename, 1, k, is_input=True)
+        save_npy(basename, 2, v, is_input=True)
+        save_npy(basename, 3, mask64, is_input=True)
+        save_npy(basename, 0, ref, is_input=False)
+
+        inputs_vi = [
+            helper.make_tensor_value_info('query', TensorProto.FLOAT, [batch, seq_q, hidden]),
+            helper.make_tensor_value_info('key', TensorProto.FLOAT, [batch, seq_kv, hidden]),
+            helper.make_tensor_value_info('value', TensorProto.FLOAT, [batch, seq_kv, v_hidden]),
+            helper.make_tensor_value_info('attention_mask', TensorProto.INT64, [batch, seq_kv]),
+        ]
+        out_vi = helper.make_tensor_value_info('output', TensorProto.FLOAT, [batch, seq_q, hidden])
+        nodes = [
+            helper.make_node('Cast', ['attention_mask'], ['mask_i32'], to=TensorProto.INT32),
+            helper.make_node('MultiHeadAttention', ['query', 'key', 'value', '', 'mask_i32'],
+                             ['output'], domain='com.microsoft', num_heads=num_heads),
+        ]
+        graph = helper.make_graph(nodes, basename, inputs_vi, [out_vi])
+        model = helper.make_model(graph, opset_imports=[
+            helper.make_opsetid('', 18), helper.make_opsetid('com.microsoft', 1)])
+        model.ir_version = 9
+        onnx.checker.check_model(model)
+        path = f"models/{basename}.onnx"
+        onnx.save(model, path)
+        print("wrote", path)
+
+
+    def build_mask_and_attention_bias_model(basename, seed):
+        """key_padding_mask and attention_bias both set, so the importer must sum the two
+        additive masks (mask_add branch in parseMultiHeadAttention) instead of one silently
+        overriding the other."""
+        rng = np.random.RandomState(seed)
+        q = rng.randn(batch, seq_q, hidden).astype(np.float32)
+        k = rng.randn(batch, seq_kv, hidden).astype(np.float32)
+        v = rng.randn(batch, seq_kv, v_hidden).astype(np.float32)
+        mask = np.ones((batch, seq_kv), dtype=np.int32)
+        mask[0, -2:] = 0
+        mask[1, -1:] = 0
+        attn_bias = (rng.randn(batch, num_heads, seq_q, seq_kv) * 0.1).astype(np.float32)
+        zero_bias = np.zeros(hidden, dtype=np.float32)
+        ref = ref_mha(q, k, v, zero_bias, zero_bias, zero_bias, mask, num_heads,
+                     attention_bias=attn_bias)
+
+        save_npy(basename, 0, q, is_input=True)
+        save_npy(basename, 1, k, is_input=True)
+        save_npy(basename, 2, v, is_input=True)
+        save_npy(basename, 3, mask, is_input=True)
+        save_npy(basename, 4, attn_bias, is_input=True)
+        save_npy(basename, 0, ref, is_input=False)
+
+        inputs_vi = [
+            helper.make_tensor_value_info('query', TensorProto.FLOAT, [batch, seq_q, hidden]),
+            helper.make_tensor_value_info('key', TensorProto.FLOAT, [batch, seq_kv, hidden]),
+            helper.make_tensor_value_info('value', TensorProto.FLOAT, [batch, seq_kv, v_hidden]),
+            helper.make_tensor_value_info('key_padding_mask', TensorProto.INT32, [batch, seq_kv]),
+            helper.make_tensor_value_info(
+                'attention_bias', TensorProto.FLOAT, [batch, num_heads, seq_q, seq_kv]),
+        ]
+        out_vi = helper.make_tensor_value_info('output', TensorProto.FLOAT, [batch, seq_q, hidden])
+        node = helper.make_node(
+            'MultiHeadAttention',
+            ['query', 'key', 'value', '', 'key_padding_mask', 'attention_bias'],
+            ['output'], domain='com.microsoft', num_heads=num_heads)
+        graph = helper.make_graph([node], basename, inputs_vi, [out_vi])
+        model = helper.make_model(graph, opset_imports=[
+            helper.make_opsetid('', 18), helper.make_opsetid('com.microsoft', 1)])
+        model.ir_version = 9
+        onnx.checker.check_model(model)
+        path = f"models/{basename}.onnx"
+        onnx.save(model, path)
+        print("wrote", path)
+
+
+    n1 = build_model("multi_head_attention_bias", use_bias=True, use_mask=False, seed=10)
+    n2 = build_model("multi_head_attention_key_padding_mask", use_bias=False, use_mask=True, seed=11,
+                     mask_filter_value=-50000.0)
+    n3 = build_model("multi_head_attention_bias_key_padding_mask", use_bias=True, use_mask=True, seed=12)
+    build_projected_model("multi_head_attention_bias_projected", seed=13)
+    build_fp16_mask_model("multi_head_attention_key_padding_mask_fp16", seed=14)
+    build_const_bias_model("multi_head_attention_bias_const", seed=15)
+    build_in_graph_mask_model("multi_head_attention_key_padding_mask_in_graph", seed=16)
+    build_mask_and_attention_bias_model("multi_head_attention_key_padding_mask_attention_bias", seed=17)
+    print("input counts:", n1, n2, n3)
+
+generate_multi_head_attention_models()
+
+def generate_deconv_gemm():
+    import onnxruntime as ort
+
+    def export(deconv, x, name):
+        with torch.no_grad():
+            deconv.weight.uniform_(-0.5, 0.5)
+            deconv.bias.uniform_(-0.2, 0.2)
+        deconv.eval()
+        path = os.path.join("models", name + ".onnx")
+        with torch.no_grad():
+            expected = deconv(x)
+            torch.onnx.export(deconv, x, path, input_names=["input"], output_names=["output"],
+                              opset_version=13, dynamo=False)
+        actual = ort.InferenceSession(path).run(None, {"input": x.numpy()})[0]
+        max_diff = np.abs(actual - expected.numpy()).max()
+        assert max_diff < 1e-5, "PyTorch/onnxruntime mismatch for {}: {}".format(name, max_diff)
+        np.save(os.path.join("data", "input_" + name + ".npy"), x.numpy())
+        np.save(os.path.join("data", "output_" + name + ".npy"), np.ascontiguousarray(expected.numpy()))
+
+    torch.manual_seed(5)
+
+    # kernel == stride: every output pixel gets exactly one tap (SAM decoder upsampling);
+    # 20 output channels leave the last channel block partial
+    export(nn.ConvTranspose2d(16, 20, kernel_size=2, stride=2), torch.empty(1, 16, 6, 5).uniform_(-1, 1),
+           "deconv_k2s2")
+
+    # overlapping taps with 40 output channels, split into several channel chunks, the last one partial
+    export(nn.ConvTranspose2d(16, 40, kernel_size=3, stride=2, padding=1, output_padding=1),
+           torch.empty(1, 16, 7, 6).uniform_(-1, 1), "deconv_overlap_chunks")
+
+    # two groups of 6 input channels, so the second group starts inside a channel block
+    export(nn.ConvTranspose2d(12, 48, kernel_size=4, stride=2, padding=1, groups=2),
+           torch.empty(2, 12, 5, 6).uniform_(-1, 1), "deconv_overlap_groups")
+
+generate_deconv_gemm()
+
+def generate_deconv_empty():
+    # Dynamic N/H/W for zero-size inputs. Bias is arange(12), so an output made only of bias is easy
+    # to check; 12 output channels leave the last channel block partial.
+    def export(name, kernel):
+        cin, cout = 4, 12
+        w = np.random.uniform(-0.5, 0.5, (cin, cout, kernel, kernel)).astype(np.float32)
+        b = np.arange(cout, dtype=np.float32)
+        node = onnx.helper.make_node("ConvTranspose", ["input", "weight", "bias"], ["output"],
+                                     kernel_shape=[kernel, kernel])
+        graph = onnx.helper.make_graph(
+            [node], name,
+            [onnx.helper.make_tensor_value_info("input", onnx.TensorProto.FLOAT, ["n", cin, "h", "w"])],
+            [onnx.helper.make_tensor_value_info("output", onnx.TensorProto.FLOAT, ["n", cout, "oh", "ow"])],
+            [onnx.numpy_helper.from_array(w, "weight"), onnx.numpy_helper.from_array(b, "bias")])
+        model = onnx.helper.make_model(graph, producer_name=name, opset_imports=[onnx.helper.make_opsetid("", 13)])
+        onnx.checker.check_model(model)
+        onnx.save(model, os.path.join("models", name + ".onnx"))
+
+    np.random.seed(7)
+    export("deconv_empty_k1", 1)  # H = 0 gives an empty output
+    export("deconv_empty_k3", 3)  # H = 0 gives two output rows of pure bias
+
+generate_deconv_empty()
+
+def generate_convtranspose_perf():
+    # Single-node models for perf_convtranspose.cpp. The weights come from ConstantOfShape, which
+    # the importer folds into constants, so each model stays a few hundred bytes.
+    def export(name, cin, cout, kernel, stride, pad, out_pad, groups, size):
+        def constant(out, shape, value):
+            return [onnx.helper.make_node("Constant", [], [out + "_shape"],
+                                          value=onnx.numpy_helper.from_array(np.array(shape, np.int64))),
+                    onnx.helper.make_node("ConstantOfShape", [out + "_shape"], [out],
+                                          value=onnx.helper.make_tensor("value", onnx.TensorProto.FLOAT, [1], [value]))]
+        nodes = constant("W", [cin, cout // groups, kernel, kernel], 0.01) + constant("B", [cout], 0.1)
+        nodes.append(onnx.helper.make_node("ConvTranspose", ["input", "W", "B"], ["output"],
+                                           kernel_shape=[kernel, kernel], strides=[stride, stride],
+                                           pads=[pad] * 4, output_padding=[out_pad, out_pad], group=groups))
+        out_size = (size - 1) * stride - 2 * pad + kernel + out_pad
+        graph = onnx.helper.make_graph(
+            nodes, name,
+            [onnx.helper.make_tensor_value_info("input", onnx.TensorProto.FLOAT, [1, cin, size, size])],
+            [onnx.helper.make_tensor_value_info("output", onnx.TensorProto.FLOAT, [1, cout, out_size, out_size])])
+        model = onnx.helper.make_model(graph, producer_name=name, opset_imports=[onnx.helper.make_opsetid("", 13)])
+        onnx.checker.check_model(model)
+        onnx.save(model, os.path.join("models", "convtranspose_perf_" + name + ".onnx"))
+
+    export("sam2_256_64", 256, 64, 2, 2, 0, 0, 1, 64)
+    export("sam2_64_32", 64, 32, 2, 2, 0, 0, 1, 128)
+    export("sam3_256_64", 256, 64, 2, 2, 0, 0, 1, 72)
+    export("sam3_64_32", 64, 32, 2, 2, 0, 0, 1, 144)
+    export("unet_256_128_k4s2p1", 256, 128, 4, 2, 1, 0, 1, 32)
+    export("gan_128_64_k4s2p1", 128, 64, 4, 2, 1, 0, 1, 64)
+    export("128_64_k3s2p1op1", 128, 64, 3, 2, 1, 1, 1, 64)
+    export("64_64_k3s1p1", 64, 64, 3, 1, 1, 0, 1, 64)
+    export("group4_128_128_k4s2p1", 128, 128, 4, 2, 1, 0, 4, 32)
+    export("depthwise_64_k4s2p1", 64, 64, 4, 2, 1, 0, 64, 64)
+
+generate_convtranspose_perf()
+
+# Models for test_fusion.cpp. Weights come from formula_weights(),
+# so the C++ test rebuilds them and computes the expected output itself.
+def generate_fast_path_models():
+    import onnxruntime as ort
+
+    # Multiples of 1/256 in [-30/256, 30/256], exact in float32; same as formulaWeights() in the test.
+    def formula_weights(shape, salt=1):
+        i = np.arange(int(np.prod(shape)), dtype=np.int64)
+        return ((((i * 37 + salt) % 61) - 30) / 256.0).astype(np.float32).reshape(shape)
+
+    def save(name, nodes, inputs, outputs, inits):
+        graph = helper.make_graph(nodes, name,
+            [helper.make_tensor_value_info(n, TensorProto.FLOAT, s) for n, s in inputs],
+            [helper.make_tensor_value_info(n, TensorProto.FLOAT, s) for n, s in outputs],
+            initializer=[numpy_helper.from_array(v, k) for k, v in inits.items()])
+        model = helper.make_model(graph, producer_name="opencv_dnn_fast_paths",
+                                  opset_imports=[helper.make_opsetid("", 17)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = os.path.join("models", name + ".onnx")
+        onnx.save(model, path)
+        # Only check that the model runs with the declared output shapes.
+        feeds = {n: np.random.uniform(-1, 1, s).astype(np.float32) for n, s in inputs}
+        results = ort.InferenceSession(path, providers=["CPUExecutionProvider"]).run(None, feeds)
+        for (n, s), y in zip(outputs, results):
+            assert list(y.shape) == s, "{}: output {} has shape {}".format(name, n, y.shape)
+
+    W = formula_weights
+    node = helper.make_node
+    silu = lambda x, y: [node("Sigmoid", [x], [x + "_sig"]), node("Mul", [x, x + "_sig"], [y])]
+    sizes = lambda *s: np.array(s, np.int64)
+
+    # LayerScale: (X*W + b) * gamma + beta folds into the Gemm. The same chain on S also
+    # outputs the MatMul result, so there the Mul must stay.
+    save("matmul_channel_affine", [
+        node("MatMul", ["X", "W"], ["mm"]),
+        node("Add", ["b", "mm"], ["proj_x"]),
+        node("Mul", ["proj_x", "gamma"], ["scaled"]),
+        node("Add", ["scaled", "beta"], ["Y"]),
+        node("MatMul", ["S", "W"], ["mm_s"]),
+        node("Add", ["b", "mm_s"], ["proj"]),
+        node("Mul", ["proj", "gamma"], ["Y_shared"]),
+    ], [("X", [2, 5, 16]), ("S", [2, 5, 16])],
+       [("Y", [2, 5, 24]), ("proj", [2, 5, 24]), ("Y_shared", [2, 5, 24])],
+       dict(W=W((16, 24)), b=W((24,), 2), gamma=1 + W((24,), 3), beta=W((24,), 4)))
+
+    # A 1x9 kernel (not 3x3), and a 3x3 conv with stride (2, 1) + SiLU and with stride (2, 2).
+    # 24 wide, so the stride-2 conv also runs the kernel's 6-pixel inner block.
+    save("conv_9tap_and_strided", [
+        node("Conv", ["X", "W1"], ["Y_1x9"], kernel_shape=[1, 9], pads=[0, 4, 0, 4]),
+        node("Conv", ["X", "W2", "B2"], ["c"], kernel_shape=[3, 3], strides=[2, 1], pads=[0, 1, 1, 2]),
+        node("Conv", ["X", "W2", "B2"], ["Y_3x3_s2"], kernel_shape=[3, 3], strides=[2, 2], pads=[0, 1, 1, 2]),
+    ] + silu("c", "Y_3x3"), [("X", [1, 16, 12, 24])],
+       [("Y_1x9", [1, 16, 12, 24]), ("Y_3x3", [1, 32, 6, 25]), ("Y_3x3_s2", [1, 32, 6, 13])],
+       dict(W1=W((16, 16, 1, 9)), W2=W((32, 16, 3, 3), 5), B2=W((32,), 6)))
+
+    # Patch embeddings with 3 input channels (plain-input path): 4x4 + ReLU, and 2x3 without bias.
+    # 17x15 is not a multiple of either patch, so the last rows and columns are dropped.
+    save("conv_patch_embed", [
+        node("Conv", ["X", "W1", "B1"], ["c"], kernel_shape=[4, 4], strides=[4, 4]),
+        node("Relu", ["c"], ["Y_4x4"]),
+        node("Conv", ["X", "W2"], ["Y_2x3"], kernel_shape=[2, 3], strides=[2, 3]),
+    ], [("X", [2, 3, 17, 15])],
+       [("Y_4x4", [2, 16, 4, 3]), ("Y_2x3", [2, 8, 8, 5])],
+       dict(W1=W((16, 3, 4, 4), 7), B1=W((16,), 8), W2=W((8, 3, 2, 3), 9)))
+
+    # Split of a conv output: aligned (the YOLO C3k2 chain), unaligned, along H, and with no sizes input.
+    save("split_block_layout", [
+        node("Conv", ["X", "W1", "B1"], ["c1"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]),
+        node("Split", ["c1", "s_aligned"], ["a", "b"], axis=1),
+        node("Conv", ["b", "W2", "B2"], ["c2"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]),
+        node("Add", ["b", "c2"], ["r"]),
+        node("Concat", ["a", "b", "r"], ["Y_aligned"], axis=1),
+        node("Split", ["c1", "s_unaligned"], ["u0", "u1"], axis=1),
+        node("Concat", ["u1", "u0"], ["Y_unaligned"], axis=1),
+        node("Split", ["c1", "s_height"], ["h0", "h1"], axis=2),
+        node("Concat", ["h0", "h1"], ["Y_height"], axis=3),
+        node("Split", ["c1"], ["d0", "d1"], axis=1),
+        node("Concat", ["d1", "d0"], ["Y_default"], axis=1),
+    ], [("X", [1, 8, 10, 12])],
+       [("Y_aligned", [1, 48, 10, 12]), ("Y_unaligned", [1, 32, 10, 12]), ("Y_height", [1, 32, 5, 24]),
+        ("Y_default", [1, 32, 10, 12])],
+       dict(W1=W((32, 8, 3, 3)), B1=W((32,), 2), W2=W((16, 16, 3, 3), 5), B2=W((16,), 6),
+            s_aligned=sizes(16, 16), s_unaligned=sizes(12, 20), s_height=sizes(5, 5)))
+
+generate_fast_path_models()
